@@ -165,7 +165,8 @@ jobs:
       # 9) Add inline comments
       - name: Add inline comments
         run: |
-          HEAD_SHA=$(git rev-parse HEAD)
+          # 在pull_request_target事件中，应该使用PR分支的SHA而不是目标分支的SHA
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           echo "HEAD_SHA=$HEAD_SHA"
 
           jq -c '.issues[]' response.json | while read -r issue; do
