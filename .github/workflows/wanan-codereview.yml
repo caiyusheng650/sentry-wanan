@@ -1,0 +1,224 @@
+name: wanan codereview
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  # 允许从PR分支直接触发，即使目标分支没有此配置
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+  contents: read
+  # 添加必要的权限以允许从PR分支运行
+  actions: read
+
+jobs:
+  wanan-codereview:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Checkout Repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2) Capture Metadata
+      - name: Normalize PR Metadata
+        id: meta
+        run: |
+          echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> $GITHUB_ENV
+          echo "REPO_OWNER=${{ github.repository_owner }}" >> $GITHUB_ENV
+          echo "REPO_NAME=${{ github.event.pull_request.head.repo.name }}" >> $GITHUB_ENV
+          echo "AUTHOR=${{ github.actor }}" >> $GITHUB_ENV
+          echo "RUN_ID=${{ github.run_id }}" >> $GITHUB_ENV
+          echo "RUN_ATTEMPT=${{ github.run_attempt }}" >> $GITHUB_ENV
+          echo "RUN_NUMBER=${{ github.run_number }}" >> $GITHUB_ENV
+
+          # Base64 encoding of title/body
+          printf "%s" "${{ github.event.pull_request.title }}" | base64 -w0 > title.b64
+          printf "%s" "${{ github.event.pull_request.body }}" | base64 -w0 > body.b64
+
+      # 3) Capture README Content
+      - name: Capture README Content
+        run: |
+          # 检查 README.md 是否存在，如果存在则进行编码，否则创建一个空文件
+          if [ -f "README.md" ]; then
+            echo "README.md found. Encoding content."
+            printf "%s" "$(cat README.md)" | base64 -w0 > readme.b64
+          else
+            echo "README.md not found. Creating empty placeholder file."
+            touch readme.b64
+          fi
+
+      # 4) Generate diff safely
+      - name: Generate diff safely
+        run: |
+          BASE="${{ github.base_ref }}"
+          if [ -z "$BASE" ]; then BASE="main"; fi
+          
+          # 在pull_request_target事件中，HEAD指向目标分支，需要获取PR分支的SHA
+          PR_HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          
+          # 使用PR分支SHA与目标分支进行diff比较
+          DIFF_RAW=$(git diff -U3 "origin/$BASE"..."$PR_HEAD_SHA")
+
+          # Prevent oversize
+          DIFF_SIZE=$(echo "$DIFF_RAW" | wc -c)
+          MAX=5000000
+          if [ "$DIFF_SIZE" -gt "$MAX" ]; then
+            echo "⚠️ Diff >5MB, truncating."
+            DIFF_RAW=$(echo "$DIFF_RAW" | head -c $MAX)
+          fi
+
+          printf "%s" "$DIFF_RAW" | base64 -w0 > diff.b64
+
+      # 5) Fetch Existing Comments
+      - name: Fetch Existing Comments
+        run: |
+          echo "Fetching existing PR review comments for context..."
+          # Fetch all review comments, keeping only relevant fields for the AI
+          COMMENTS_JSON=$(gh api \
+            repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments \
+            --jq '[.[] | {id: .id, user: .user.login, body: .body, path: .path, line: .line}]')
+          
+          # Base64 encode the comments JSON
+          printf "%s" "$COMMENTS_JSON" | base64 -w0 > comments.b64
+          echo "Comments JSON encoded into comments.b64."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 使用内置的 GITHUB_TOKEN 进行 API 访问
+
+      # 6) Build JSON Payload
+      - name: Build JSON Payload
+        run: |
+          cat <<EOF > payload.json
+          {
+            "githubactionid" : "${{ env.RUN_ID }}",
+            "diff_base64": "$(cat diff.b64)",
+            "pr_number": "${{ env.PR_NUMBER }}",
+            "pr_title_b64": "$(cat title.b64)",
+            "pr_body_b64": "$(cat body.b64)",
+            "readme_b64": "$(cat readme.b64)",
+            "repo_owner": "${{ env.REPO_OWNER }}",
+            "repo_name": "${{ env.REPO_NAME }}",
+            "author": "${{ env.AUTHOR }}",
+            "comments_b64": "$(cat comments.b64)"
+          }
+          EOF
+          
+          echo "=== API Payload (payload.json) ==="
+          cat payload.json
+          echo "=================================="
+
+      # 7) Send to AI Review API
+      - name: Call AI Review API
+        run: |
+          # 打印API URL用于调试（注意：GitHub Actions会自动保护敏感信息）
+          echo "使用的API URL: ${{ secrets.CODE_REVIEW_API_URL }}"
+          
+          curl -v -X POST \
+            -H "X-Api-Key: ${{ secrets.CODE_REVIEW_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data-binary @payload.json \
+            "${{ secrets.CODE_REVIEW_API_URL }}/api/codereview/review" \
+            -o response.json
+
+          echo "=== API Response (response.json) ==-"
+          cat response.json
+          echo "===================================="
+
+      # 8) Format markdown
+      - name: Generate Review Markdown
+        run: |
+          # 首先根据严重程度生成conclusion
+          jq '
+            .conclusion = (
+              if (.issues | to_entries | map(.value.severity) | any(. == "严重" or . == "中等")) 
+              then "不建议合并" 
+              else "建议合并" 
+              end
+            )
+          ' response.json > temp.json && mv temp.json response.json
+          
+          # 然后生成Markdown（重点处理历史未修复问题）
+          jq -r '
+            "## 🤖 AI 代码审查意见\n" +
+            "**合并建议**: \(.conclusion)\n\n" +
+            "### 问题列表\n" +
+            (
+              .issues | to_entries | map(
+                # 对历史未修复问题添加醒目标识
+                (if .value.historical_mention == true then "⚠️ **[历史未修复问题]**\n" else "" end) +
+                "- **文件**: " + .value.file +
+                " (行 " + (.value.line|tostring) + ")\n" +
+                "  - 类型: **" + .value.bug_type + "**\n" +
+                "  - 程度: **" + .value.severity + "**\n" +
+                # 历史问题补充提示文字
+                (if .value.historical_mention == true then "  - 提示: 此问题已在历史审查中多次提及，请优先修复\n" else "" end) +
+                "  - 描述: " + .value.description + "\n" +
+                "  - 建议: " + .value.suggestion + "\n"
+              ) | join("\n")
+            )
+          ' response.json > comment.md
+
+          echo "Markdown generated:"
+          cat comment.md
+
+
+      # 9) Add inline comments
+      - name: Add inline comments
+        run: |
+          # 在pull_request_target事件中，应该使用PR分支的SHA而不是目标分支的SHA
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          echo "HEAD_SHA=$HEAD_SHA"
+
+          jq -c '.issues[]' response.json | while read -r issue; do
+            file=$(echo "$issue" | jq -r '.file')
+            line=$(echo "$issue" | jq -r '.line')
+            type=$(echo "$issue" | jq -r '.bug_type')
+            desc=$(echo "$issue" | jq -r '.description')
+            sug=$(echo "$issue" | jq -r '.suggestion')
+            sev=$(echo "$issue" | jq -r '.severity')
+            # 提取历史未修复标记
+            historical=$(echo "$issue" | jq -r '.historical_mention')
+
+            # 对历史未修复问题添加特殊前缀和提示
+            if [ "$historical" = "true" ]; then
+              header="**AI 代码审查意见**"
+              extra_note=$'\n**提示**: 此问题已在历史审查中多次提及，请优先处理'
+            else
+              header="**AI 代码审查意见**"
+              extra_note=""
+            fi
+
+            # 拼接评论内容（包含历史问题标识）
+            body=$(printf "%s\n**类型**: %s\n**描述**: %s\n**建议**: %s\n**程度**: %s%s" \
+              "$header" "$type" "$desc" "$sug" "$sev" "$extra_note")
+
+            echo "Attempting to add inline comment to $file:$line"
+
+            # 保留原有的错误处理逻辑
+            if ! gh api \
+              repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments \
+              -X POST \
+              -f body="$body" \
+              -f commit_id="$HEAD_SHA" \
+              -f path="$file" \
+              -F line="$line" > /dev/null 2>&1
+            then
+              echo "❌ ERROR: Failed to add inline comment to $file:$line"
+            else
+              echo "✅ Success: Added inline comment to $file:$line"
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 10) Create Summary Comment
+      - name: Create or update summary comment
+        uses: peter-evans/create-or-update-comment@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ env.PR_NUMBER }}
+          body-file: comment.md
+          edit-mode: replace
