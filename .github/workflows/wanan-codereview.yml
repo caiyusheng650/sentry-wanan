@@ -113,6 +113,7 @@ jobs:
       # 7) Send to AI Review API
       - name: Call AI Review API
         run: |
+          echo "使用的API URL: ${{ secrets.CODE_REVIEW_API_URL }}"
           curl -v -X POST \
             -H "X-Api-Key: ${{ secrets.CODE_REVIEW_API_TOKEN }}" \
             -H "Content-Type: application/json" \
