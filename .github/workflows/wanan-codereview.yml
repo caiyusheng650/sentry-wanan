@@ -219,5 +219,5 @@ jobs:
           issue-number: ${{ env.PR_NUMBER }}
           body-file: comment.md
           edit-mode: replace
-          # 添加comment-tag以确保总是更新同一评论
-          comment-tag: "ai-code-review-summary"
+
+
