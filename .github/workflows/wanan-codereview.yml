@@ -120,6 +120,7 @@ jobs:
             -H "X-Api-Key: ${{ secrets.CODE_REVIEW_API_TOKEN }}" \
             -H "Content-Type: application/json" \
             --data-binary @payload.json \
+            --max-time 3600 \
             "${{ secrets.CODE_REVIEW_API_URL }}/api/codereview/review" \
             -o response.json
 
